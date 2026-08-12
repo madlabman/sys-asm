@@ -137,6 +137,91 @@ contract SweepThresholdTest is Test {
         assertStorage(excess_slot, inhibitor - target_per_block - 1, "didn't expect excess to be reset");
     }
 
+    // testSetInhibitorViaSystemCall verifies that a system call with input sets the
+    // inhibitor to prevent further additions. The requests are still dequeued as
+    // usual, i.e. up to max_per_block per call, so repeated calls with input drain
+    // the queue and eventually reset it, all while keeping the queue disabled.
+    function testSetInhibitorViaSystemCall() public {
+        uint256 requestCount = max_per_block + 4;
+        for (uint256 i = 0; i < requestCount; i++) {
+            addRequest(nextAddress(i), makeSweepThreshold(i), 2);
+        }
+
+        // Disable the queue with a system call that carries input data. Only
+        // max_per_block requests are dequeued, the rest remain in the queue.
+        vm.prank(sysaddr);
+        (bool ret, bytes memory data) = addr.call(hex"01");
+        assertEq(ret, true);
+        checkRequestData(data, 0, max_per_block);
+        assertStorage(excess_slot, inhibitor, "expected inhibitor in excess storage slot");
+        assertStorage(queue_head_slot, max_per_block, "unexpected queue head");
+        assertStorage(queue_tail_slot, requestCount, "unexpected queue tail");
+
+        // Check that requesting the current fee fails.
+        (ret,) = addr.staticcall("");
+        assertEq(ret, false, "expected fee getter to fail");
+
+        // Check that adding a request fails.
+        addFailedRequest(nextAddress(requestCount), makeSweepThreshold(requestCount), 2);
+
+        // A subsequent system call with input dequeues the remaining requests and
+        // resets the queue pointers, while keeping the queue disabled.
+        vm.prank(sysaddr);
+        (ret, data) = addr.call(hex"01");
+        assertEq(ret, true);
+        checkRequestData(data, max_per_block, requestCount - max_per_block);
+        assertStorage(excess_slot, inhibitor, "expected inhibitor to remain in excess storage slot");
+        assertStorage(queue_head_slot, 0, "expected queue head reset");
+        assertStorage(queue_tail_slot, 0, "expected queue tail reset");
+
+        // Further system calls with input return no data and keep the queue disabled.
+        vm.prank(sysaddr);
+        (ret, data) = addr.call(hex"01");
+        assertEq(ret, true);
+        assertEq(data.length, 0, "expected no requests from an empty queue");
+        assertStorage(excess_slot, inhibitor, "expected inhibitor to remain in excess storage slot");
+
+        // Check that adding a request still fails.
+        addFailedRequest(nextAddress(requestCount), makeSweepThreshold(requestCount), 2);
+
+        // Now re-enable the queue through a system call with no input.
+        vm.prank(sysaddr);
+        (ret, data) = addr.call("");
+        assertEq(ret, true);
+        assertEq(data.length, 0, "expected no requests from an empty queue");
+        assertStorage(excess_slot, 0, "expected zero excess requests after re-enabling queue");
+
+        // Check that adding a request succeeds again.
+        addRequest(nextAddress(requestCount + 1), makeSweepThreshold(requestCount + 1), 2);
+    }
+
+    // testQueueDisableFeeReset verifies that re-enabling the queue resets the fee to 1.
+    function testQueueDisableFeeReset() public {
+        uint256 requestCount = max_per_block * 4;
+        for (uint256 i = 0; i < requestCount; i++) {
+            uint256 fee = getCurrentFee();
+            addRequest(nextAddress(i), makeSweepThreshold(i), fee);
+        }
+        assertStorage(count_slot, requestCount, "unexpected request count");
+
+        // Disable the queue with a system call that carries input data.
+        vm.prank(sysaddr);
+        (bool ret, bytes memory data) = addr.call(hex"01");
+        assertEq(ret, true);
+        assertEq(data.length, max_per_block * 76, "expected max_per_block requests to be dequeued");
+        assertStorage(excess_slot, inhibitor, "expected inhibitor in excess storage slot");
+
+        // Now re-enable the queue through a system call with no input.
+        vm.prank(sysaddr);
+        (ret, data) = addr.call("");
+        assertEq(ret, true);
+        assertEq(data.length, max_per_block * 76, "expected max_per_block requests to be dequeued");
+        assertStorage(excess_slot, 0, "expected zero excess requests after re-enabling queue");
+
+        // Check that adding a request succeeds again with fee 1.
+        addRequest(nextAddress(999), makeSweepThreshold(999), 1);
+    }
+
     // addRequest submits a request and verifies its queue storage representation.
     function addRequest(address from, bytes memory req, uint256 value) internal {
         uint256 requests = load(count_slot);
@@ -157,8 +242,14 @@ contract SweepThresholdTest is Test {
     }
 
     // checkSweepThresholds simulates a system call and verifies the returned requests.
-    function checkSweepThresholds(uint256 startIndex, uint256 count) internal returns (uint256) {
+    function checkSweepThresholds(uint256 startIndex, uint256 count) internal {
         bytes memory requests = getRequests();
+        checkRequestData(requests, startIndex, count);
+    }
+
+    // checkRequestData verifies the given dequeued request data against the
+    // requests generated from startIndex onwards.
+    function checkRequestData(bytes memory requests, uint256 startIndex, uint256 count) internal {
         assertEq(requests.length, count * 76);
 
         for (uint256 i = 0; i < count; i++) {
@@ -186,8 +277,6 @@ contract SweepThresholdTest is Test {
             uint256 thresholdSent = toFixed(request, 48, 48 + 8) >> 192;
             assertEq(endianReverse(thresholdRecovered), thresholdSent, "unexpected threshold returned");
         }
-
-        return count;
     }
 
     // Returns pseudo-random address based on X.
@@ -207,6 +296,13 @@ contract SweepThresholdTest is Test {
         bytes memory out = bytes.concat(pubkey, threshold);
         assertEq(out.length, 56, "built sweep_threshold payload with invalid length");
         return out;
+    }
+
+    // getCurrentFee returns the current fee computed by the system contract.
+    function getCurrentFee() internal view returns (uint256) {
+        (bool ok, bytes memory data) = addr.staticcall("");
+        assert(ok);
+        return uint256(bytes32(data));
     }
 
     function minstd(uint256 state) internal pure returns (uint256) {

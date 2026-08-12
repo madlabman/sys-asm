@@ -202,6 +202,11 @@ handle_input:
 ;;; queue by modifying the queue's head index. The excess requests accumulator
 ;;; is updated so that the new cost of submitting a request is reflected.
 ;;; Finally, the request count is reset.
+;;;
+;;; If the system call carries any input data, the queue is disabled by
+;;; storing EXCESS_INHIBITOR into the excess slot, causing all subsequent user
+;;; calls to revert. A later system call with empty input re-enables the queue
+;;; by restoring the excess value to zero.
 
 read_requests:
     ;; Determine the size of the queue by calculating tail - head.
@@ -217,8 +222,8 @@ read_requests:
 
     ;; Determine if count is greater than the max set sweep threshold requests.
     dup1                     ; [count, count, head_idx, tail_idx]
-    push MAX_PER_BLOCK       ; [reqs_per_block, count, count, head_idx, tail_idx]
-    gt                       ; [reqs_per_block > count, count, head_idx, tail_idx]
+    push MAX_PER_BLOCK       ; [max_per_block, count, count, head_idx, tail_idx]
+    gt                       ; [max_per_block > count, count, head_idx, tail_idx]
     jumpi @begin_loop        ; [count, head_idx, tail_idx]
 
     ;; Discard count, use the max set sweep threshold requests per block.
@@ -364,47 +369,48 @@ reset_queue:
     sstore                   ; [count]
 
 update_excess:
-    ;; Update the new excess set sweep threshold requests.
+    ;; If the system call receives any input, disable the queue by storing
+    ;; EXCESS_INHIBITOR into the excess slot.
+    calldatasize             ; [calldatasize, count]
+    jumpi @set_inhibitor     ; [count]
+
+    ;; Load current excess and added-in-block counter values.
     push SLOT_EXCESS         ; [excess_slot, count]
     sload                    ; [excess, count]
-
-    ;; Check if excess needs to be reset to 0 for first iteration after
-    ;; activation.
-    dup1                     ; [excess, excess, count]
-    push EXCESS_INHIBITOR    ; [inhibitor, excess, excess, count]
-    eq                       ; [inhibitor == excess, excess, count]
-    iszero                   ; [inhibitor != excess, excess, count]
-    jumpi @skip_reset        ; [excess, count]
-
-    ;; Drop the count from stack and use 0.
-    pop                      ; [count]
-    push 0                   ; [reset_excess]
-
-skip_reset:
     push SLOT_COUNT          ; [count_slot, excess, count]
-    sload                    ; [count, excess, count]
+    sload                    ; [added_count, excess, count]
+
+    ;; If inhibitor is set, restore excess to zero, i.e. re-enable the queue.
+    dup2                     ; [excess, added_count, excess, count]
+    push EXCESS_INHIBITOR    ; [inhibitor, excess, added_count, excess, count]
+    eq                       ; [excess == inhibitor, added_count, excess, count]
+    jumpi @zero_excess       ; [added_count, excess, count]
 
     ;; If the sum of the previous excess requests and requests added in the
     ;; current block is greater than the target, subtract the target from the sum
     ;; and set it as the new excess set sweep threshold requests value.
-    push TARGET_PER_BLOCK    ; [target, count, excess, count]
-    dup3                     ; [excess, target, count, excess, count]
-    dup3                     ; [count, excess, target, count, excess, count]
-    add                      ; [count+excess, target, count, excess, count]
-    gt                       ; [count+excess > target, count, excess, count]
-    jumpi @compute_excess    ; [count, excess, count]
+    push TARGET_PER_BLOCK    ; [target, added_count, excess, count]
+    dup3                     ; [excess, target, added_count, excess, count]
+    dup3                     ; [added_count, excess, target, added_count, excess, count]
+    add                      ; [added_count+excess, target, added_count, excess, count]
+    gt                       ; [added_count+excess > target, added_count, excess, count]
+    jumpi @compute_excess    ; [added_count, excess, count]
 
-    ;; Zero out excess.
+zero_excess:
     pop                      ; [excess, count]
     pop                      ; [count]
     push 0                   ; [0, count]
     jump @store_excess       ; [0, count]
 
 compute_excess:
-    add                      ; [count+excess, count]
-    push TARGET_PER_BLOCK    ; [target, count+excess, count]
-    swap1                    ; [count+excess, target, count]
+    add                      ; [added_count+excess, count]
+    push TARGET_PER_BLOCK    ; [target, added_count+excess, count]
+    swap1                    ; [added_count+excess, target, count]
     sub                      ; [new_excess, count]
+    jump @store_excess       ; [new_excess, count]
+
+set_inhibitor:               ; [count]
+    push EXCESS_INHIBITOR    ; [new_excess, count]
 
 store_excess:
     push SLOT_EXCESS         ; [excess_slot, new_excess, count]
